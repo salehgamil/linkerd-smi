@@ -3,6 +3,8 @@ package adaptor
 import (
 	"context"
 	"fmt"
+	"regexp"
+	"strconv"
 	"time"
 
 	serviceprofile "github.com/linkerd/linkerd2/controller/gen/apis/serviceprofile/v1alpha2"
@@ -21,6 +23,10 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/tools/record"
 	"k8s.io/client-go/util/workqueue"
+
+	"github.com/prometheus/client_golang/api"
+	v1 "github.com/prometheus/client_golang/api/prometheus/v1"
+	"github.com/prometheus/common/model"
 )
 
 const (
@@ -166,7 +172,7 @@ func (c *SMIController) runWorker() {
 // attempt to process it, by calling the syncHandler.
 func (c *SMIController) processNextWorkItem() bool {
 	obj, shutdown := c.workqueue.Get()
-
+	fmt.Printf("Processing TrafficSplit\n")
 	if shutdown {
 		return false
 	}
@@ -223,6 +229,7 @@ func (c *SMIController) syncHandler(ctx context.Context, tsKey trafficSplitKey) 
 
 	// Get the Ts resource with this namespace/name
 	ts, err := c.tsclientset.SplitV1alpha1().TrafficSplits(tsKey.namespace).Get(ctx, tsKey.name, metav1.GetOptions{})
+	// c.tsclientset.SplitV1alpha1().TrafficSplits(tsKey.namespace).Update()
 	if err != nil {
 		// Return if its not a not found error
 		if !errors.IsNotFound(err) {
@@ -280,6 +287,13 @@ func (c *SMIController) syncHandler(ctx context.Context, tsKey trafficSplitKey) 
 			log.Infof("skipping update of serviceprofile/%s as ignore annotation is present", sp.Name)
 			return nil
 		}
+
+		loadBalance(ts)
+		_, err = c.tsclientset.SplitV1alpha1().TrafficSplits(tsKey.namespace).Update(ctx, ts, metav1.UpdateOptions{})
+		if err != nil {
+			return err
+		}
+		c.tsEventRecorder.Eventf(ts, corev1.EventTypeNormal, "Updated", "Update Traffic Split %s", ts.Name)
 
 		// Update the Service Profile
 		updateDstOverrides(sp, ts, c.clusterDomain)
@@ -350,4 +364,85 @@ func (c *SMIController) toFQDN(service, namespace string) string {
 
 func fqdn(service, namespace, clusterDomain string) string {
 	return fmt.Sprintf("%s.%s.svc.%s", service, namespace, clusterDomain)
+}
+
+func queryPrometheus(ts *trafficsplit.TrafficSplit) map[string]float64 {
+	client, err := api.NewClient(api.Config{
+		Address: "http://prometheus.linkerd-viz.svc.cluster.local:9090",
+	})
+	if err != nil {
+		fmt.Printf("Error creating client: %v\n", err)
+	}
+
+	v1api := v1.NewAPI(client)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	result, warnings, err := v1api.Query(ctx, queryString(ts), time.Now(), v1.WithTimeout(5*time.Second))
+	if err != nil {
+		fmt.Printf("Error querying Prometheus: %v\n", err)
+	}
+	if len(warnings) > 0 {
+		fmt.Printf("Warnings: %v\n", warnings)
+	}
+
+	r := result.(model.Vector)
+	re := regexp.MustCompile(`\{dst_serviceaccount="(.*)"\}`)
+	latencies := make(map[string]float64)
+
+	for _, sample := range r {
+		match := re.FindStringSubmatch(sample.Metric.String())
+		serviceName := match[1]
+		latency, _ := strconv.ParseFloat(sample.Value.String(), 8)
+		latencies[serviceName] = latency
+		fmt.Printf("SeriveName is: %s \n", serviceName)
+		fmt.Printf("Latency is: %f \n", latency)
+	}
+
+	return latencies
+}
+
+func queryString(ts *trafficsplit.TrafficSplit) string {
+	return fmt.Sprintf(`
+	histogram_quantile(
+		0.50 , 
+		sum(
+			irate( 
+				response_latency_ms_bucket{dst_service =~ '%s.*' , direction = 'outbound' , namespace = '%s'}[20s]
+				)
+			) 
+			by (le, dst_serviceaccount)
+		)`, ts.Spec.Service, ts.Namespace)
+}
+
+func scoreLatencies(latencies map[string]float64) map[string]float64 {
+	var sum float64
+	for _, value := range latencies {
+		sum += value
+	}
+	for i, value := range latencies {
+		latencies[i] = (sum / value)
+	}
+
+	for _, value := range latencies {
+		sum += value
+	}
+
+	for i, value := range latencies {
+		latencies[i] = (value / sum) * 100
+	}
+
+	return latencies
+}
+
+func loadBalance(ts *trafficsplit.TrafficSplit) *trafficsplit.TrafficSplit {
+	measuredLatencies := queryPrometheus(ts)
+	latencies := scoreLatencies(measuredLatencies)
+
+	for i, backend := range ts.Spec.Backends {
+		backend.Weight.Set(int64(0.1*(latencies[backend.Service]) + 0.9*backend.Weight.AsApproximateFloat64()))
+		fmt.Printf("Backend after change is: \n %v \n", backend)
+		ts.Spec.Backends[i] = trafficsplit.TrafficSplitBackend{Service: backend.Service, Weight: backend.Weight}
+	}
+
+	return ts
 }

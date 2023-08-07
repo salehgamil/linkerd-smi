@@ -19,6 +19,7 @@ import (
 )
 
 func main() {
+	log.Info("Started the custom Linkerd-Smi controller")
 	cmd := flag.NewFlagSet("smi-adaptor", flag.ExitOnError)
 
 	kubeConfigPath := cmd.String("kubeconfig", "", "path to kube config")
